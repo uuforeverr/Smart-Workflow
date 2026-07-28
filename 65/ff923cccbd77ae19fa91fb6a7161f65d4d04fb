@@ -1,0 +1,23 @@
+docs/M5_GraphJSON-IR-BPMN生成方案.html
+  s_542a84f8bebb3d::t_8c03e9c2a31e54 1-433
+docs/M5_GraphJSON-IR-BPMN生成方案.md
+  s_542a84f8bebb3d::t_d7443314b982c0 1-523
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.10",
+  "base_commit_sha": "65ff923cccbd77ae19fa91fb6a7161f65d4d04fb",
+  "prompts": {},
+  "sessions": {
+    "s_542a84f8bebb3d": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a68809ed643d95335f44e6e",
+        "model": "openrouter-3o__max"
+      },
+      "human_author": "renming.010207 <renming.010207@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
