@@ -1,120 +1,367 @@
 # Smart-Workflow
 
-面向 AI Agent 的工作流引擎：把自然语言需求增量构建成**可复用、可验证、可运行**的工作流。
-Go 引擎 + Python sidecar（隔离执行用户代码）+ `swf` CLI（输出统一 JSON envelope，供 Agent 直接解析）。
+面向 AI Agent 的可编程工作流引擎。它将工作流的**本地增量编辑、静态校验、单节点调试、版本发布和异步执行**组织成一条可自动化闭环。
 
-## 架构
+项目以 Go 实现 API、CLI、调度器和存储层，以 Python sidecar 隔离执行用户代码。`swf` CLI 的输入是明确的参数，输出是统一 JSON envelope，便于 Agent 解析错误并逐步修正工作流。
+
+## 核心能力
+
+- **IR / DSL 两层模型**：本地 IR 适合增量编辑，发布或执行前渲染为 DSL；支持 DSL 反向恢复为 IR。
+- **Agent 友好的 CLI**：支持命令式建图、声明式 `plan-apply`、复用已有工作流、离线校验、预览、调试、上传与运行。
+- **运行前静态校验**：检查图结构、端口、绑定、引用、类型、环和可达性，返回结构化 issue。
+- **依赖驱动调度**：按 `edges ∪ bindings` 构建依赖，并发执行就绪节点，记录节点输入、输出、耗时、状态和重试次数。
+- **多类节点**：`start`、`end`、`condition`、`http`、`code`、`application`、`dataset`，以及节点级 `batch`。
+- **Python 代码执行**：sidecar 在一次性子进程中执行用户代码，提供超时、日志/输出限流和错误脱敏。
+- **版本化存储**：草稿可更新，发布版本不可变；更新草稿使用乐观锁。
+- **异步运行与事件流**：Redis + asynq 执行长工作流，通过 Redis Stream 提供 SSE 事件；也保留进程内执行后端。
+- **能力复用**：搜索 application/workflow、读取应用 schema、计算合法绑定候选、克隆已发布工作流。
+
+## 系统架构
 
 ```text
-                    ┌──────────────┐
-   swf CLI ───────▶ │  swf-server  │ ──── MySQL (工作流/应用/评测集/运行)
-  (建图/校验/运行)   │   (gin API)  │ ──── Redis (缓存 + asynq 队列 + SSE 事件流)
-                    └──────┬───────┘
-                           │ 入队 run
-                    ┌──────▼───────┐
-                    │  swf-worker  │ ──── engine.Run（DAG 调度 + 节点执行器）
-                    │ (asynq 消费) │           │
-                    └──────────────┘           │ code / application(python) 节点
-                                        ┌───────▼────────┐
-                                        │ Python sidecar │ 子进程隔离执行用户代码
-                                        └────────────────┘
+                       MySQL
+                         ▲
+                         │ metadata / DSL / run snapshots
+┌─────────┐  HTTP  ┌─────┴──────┐     enqueue      ┌────────────┐
+│ swf CLI ├───────►│ swf-server ├─────────────────►│ swf-worker │
+└────┬────┘        │  gin API   │     Redis/asynq  │ engine.Run │
+     │             └─────┬──────┘◄─────────────────└─────┬──────┘
+     │ local IR           │       Redis Stream / SSE      │
+     │ validate/render    │                               │ code
+     ▼                    ▼                               ▼
+session directory   HTTP clients                    Python sidecar
+ir.json / dsl.json  and API users                  one-shot runner
 ```
 
-- **IR → DSL 两层模型**：IR 可增量编辑（add-node/bind/plan-apply），渲染成可执行 DSL。
-- **执行后端可切换**：配 Redis 走 asynq（server 入队、worker 执行、SSE 从 Redis Stream 订阅）；
-  无 Redis 则进程内 dispatcher 兜底 + 内存事件总线。切换不改 handler。
-- **节点执行器**：start/end、code（Python sidecar）、application（按 kind 委托 http/python）、
-  dataset（评测集行集）、condition（分支）；任意节点可开 **batch** 对数组输入逐条执行。
+默认配置连接 Redis，因此 `swf-server` 负责入队，`swf-worker` 负责执行。完整 Docker Compose 会同时启动 MySQL、Redis、sidecar、server、worker，并通过一次性 migrate 服务自动建表。
 
-## 30 分钟起步
+## 快速开始
 
-### 方式 A：容器一键起五件套（推荐用于试跑）
+### 环境要求
 
-> ⚠️ **诚实说明**：本仓库的容器编排（compose + 5 个 Dockerfile）已按最佳实践写好并做过
-> YAML/构建阶段静态校验，但**尚未在装有 Docker 的机器上做过 live 端到端拉起**（开发机无 Docker）。
-> 若你的机器有 Docker，下面命令即为设计入口；如遇问题请对照「方式 B」逐件排查。
+- Docker 与 Docker Compose v2：运行完整服务栈。
+- Go `1.26.4`：在宿主机编译或运行 `swf` CLI，与 [`go.mod`](go.mod) 保持一致。
+- `jq`、`curl`：运行仓库内的情感评测示例。
+- 本地开发 sidecar 时需要 Python `3.9+`；容器镜像使用 Python 3.12。
+
+### 1. 启动完整服务栈
 
 ```bash
-# 起 mysql + redis + sidecar + server + worker，migrate 服务自动建表
-make up-all              # = docker compose -f deployments/docker-compose.yaml up -d --build
+git clone https://github.com/uu999/Smart-Workflow.git
+cd Smart-Workflow
 
-# 看日志 / 停
+make up-all
+docker compose -f deployments/docker-compose.yaml ps
+```
+
+服务端口：
+
+| 服务 | 宿主机地址 | 用途 |
+|---|---|---|
+| server | `http://127.0.0.1:8080` | HTTP API |
+| sidecar | `http://127.0.0.1:8090` | Python code 节点 |
+| MySQL | `127.0.0.1:3308` | 元数据与运行快照 |
+| Redis | `127.0.0.1:6381` | 缓存、队列与事件流 |
+
+检查服务：
+
+```bash
+curl -s http://127.0.0.1:8080/healthz | jq
+curl -s http://127.0.0.1:8080/healthz/sidecar | jq
+```
+
+查看日志或停止服务：
+
+```bash
 make logs-all
 make down-all
 ```
 
-容器内地址由 compose 经 `SWF_MYSQL_DSN`/`SWF_REDIS_ADDR`/`SWF_SIDECAR_BASEURL` 注入
-（服务名 `mysql:3306`/`redis:6379`/`sidecar:8090`）；宿主机仍可用映射端口 `3308`/`6381`/`8090` 连基建调试。
-
-### 方式 B：本地进程起（可逐件验证）
+### 2. 安装 CLI
 
 ```bash
-# 1) 起基建（仅 mysql + redis 容器）
-make infra-up
+make build-swf
+export PATH="$PWD/bin:$PATH"
 
-# 2) 建表
-make migrate-up
-
-# 3) 起 sidecar（新终端）
-make sidecar-install     # 首次：建 venv 装依赖
-make run-sidecar         # 监听 127.0.0.1:8090
-
-# 4) 起 server（新终端）
-make run-server          # 监听 :8080；无 Redis 配置时用进程内 dispatcher，单进程即可跑通
-
-# （可选）配了 Redis 时另起 worker：make run-worker
+swf --help
 ```
 
-### 跑通端到端样例（情感评测）
-
-见 [examples/sentiment](examples/sentiment)：评测集 → 分类器（逐条 batch）→ 结果合并 → End。
+CLI 默认访问 `http://127.0.0.1:8080`。可通过 `--server` 或环境变量覆盖：
 
 ```bash
 export SWF_SERVER_URL=http://127.0.0.1:8080
-# 若未把 swf 装进 PATH，可： export SWF="go run ./cmd/swf"
-
-bash examples/sentiment/01_seed.sh   # 建 project + dataset + 分类器 application
-bash examples/sentiment/02_run.sh    # plan-apply 建图 → validate → upload → run --stream
+export SWF_API_KEY=your-key     # 仅在服务端启用 API Key 时需要
 ```
 
-预期：`run --stream` 实时打印各节点事件，最终结果含 `accuracy`/`total`/`details`（准召统计）。
+### 3. 运行端到端示例
 
-## swf CLI 速览
+[`examples/sentiment`](examples/sentiment) 展示：
+
+```text
+dataset → Python application（batch 逐条分类）→ code 聚合准确率 → end
+```
+
+```bash
+export SWF_SERVER_URL=http://127.0.0.1:8080
+export SWF=swf
+
+bash examples/sentiment/01_seed.sh
+bash examples/sentiment/02_run.sh
+```
+
+脚本会依次创建 project、dataset 和 application，通过 `plan-apply` 建图，离线校验并上传草稿，最后以 `run --stream` 执行。预期终态为 `succeeded`，输出包含 `accuracy`、`total` 和逐条 `details`。
+
+## CLI 使用
+
+### 标准工作流
+
+```text
+能力搜索/复用
+      ↓
+init 或 plan-apply
+      ↓
+add-node / add-edge / bind
+      ↓
+validate → preview
+      ↓
+node-debug
+      ↓
+upload
+      ↓
+run --stream
+```
+
+构建类命令只修改本地 session；`validate` 和 `preview` 也在 CLI 进程内完成。能力查询、数据集管理、`node-debug`、`upload` 和 `run` 等命令才访问服务端。
+
+本地 session 默认位于 `$HOME/tmp/swf/sessions/<sid>/`，可用 `SWF_SESSIONS_DIR` 覆盖。目录中主要包含：
+
+```text
+ir.json       # 编辑态 IR
+meta.json     # 名称、项目和来源信息
+dsl.json      # preview/upload 产生的执行态 DSL
+app_cache/    # application schema 缓存
+```
+
+### 声明式建图
+
+复杂工作流推荐使用一份 plan 一次性声明节点、边、绑定、参数和 batch：
+
+```bash
+swf plan-schema
+swf plan-apply --file examples/sentiment/plan.json
+```
+
+`plan-apply` 是**构建期**批量建图；`batch` 是**运行期**让单个节点遍历数组输入，两者语义不同。
+
+### 增量建图
+
+下面构建一个最小的 `start → end` 工作流：
+
+```bash
+swf init --name hello-flow --project-id <project-id> --sid hello
+
+swf add-node --sid hello --id start_0 --kind start \
+  --outputs 'message:string:required'
+swf add-node --sid hello --id end_0 --kind end \
+  --inputs 'message:string:required'
+
+swf add-edge --sid hello --source start_0 --target end_0
+swf bind --sid hello --node-id end_0 --port message \
+  --mode ref --source-node start_0 --source-port message
+
+swf validate --sid hello
+swf preview --sid hello --print-full
+swf upload --sid hello
+```
+
+所有命令输出统一 envelope：
+
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "NODE_NOT_FOUND",
+    "message": "source node \"app_1\" not found",
+    "hint": "先 add-node 再连边"
+  }
+}
+```
+
+### 常用命令
 
 | 命令 | 作用 |
 |---|---|
-| `swf search --kind application\|workflow` | 能力发现：搜可复用应用/工作流 |
-| `swf dataset-create/dataset-list/dataset-get` | 评测集管理（创建从 JSON 数组文件灌入） |
-| `swf clone-ref --workflow-id` | 克隆已发布工作流到本地 IR 会话（复用优先） |
-| `swf plan-apply --file plan.json` | **声明式建图**：一份 JSON 落节点/边/绑定/batch/params |
-| `swf plan-schema` | 打印 plan.json 规格（Agent 自检字段） |
-| `swf add-node/add-edge/bind` | 逐条增量建图 |
-| `swf validate / preview` | 离线校验（唯一 start/end、连通、绑定端口存在）/ 预览 DSL |
-| `swf node-debug --sid --node-id` | 无状态单节点调试 |
-| `swf upload --sid` | 渲染 IR→DSL 上传成工作流草稿 |
-| `swf run --workflow-id [--version -1] [--stream]` | 整图运行（异步；-1 跑草稿；--stream 看实时事件） |
+| `swf search --project-id ID --kind application\|workflow` | 搜索可复用能力 |
+| `swf app-schema --sid SID --app-id ID` | 获取并缓存 application 端口 schema |
+| `swf scope --sid SID --node-id ID --port PORT` | 计算某输入端口的合法引用候选 |
+| `swf clone-ref --workflow-id ID` | 将已发布工作流克隆为本地 IR session |
+| `swf plan-schema` | 输出 plan JSON 规格 |
+| `swf plan-apply --file plan.json` | 声明式创建完整本地图 |
+| `swf add-node` / `add-edge` / `bind` | 增量编辑本地 IR |
+| `swf remove-node` / `remove-edge` / `remove-binding` | 删除并清理本地图元素 |
+| `swf validate --sid SID` | 离线静态校验 |
+| `swf preview --sid SID` | 离线渲染并保存 DSL |
+| `swf node-debug --sid SID --node-id ID` | 上传前无状态单节点调试 |
+| `swf upload --sid SID` | 新建服务端工作流草稿 |
+| `swf upload --sid SID --update-id ID --confirm --version-lock N` | 乐观锁覆盖现有草稿 |
+| `swf run --workflow-id ID --version -1 --stream` | 执行草稿并订阅实时事件 |
+| `swf dataset-create` / `dataset-list` / `dataset-get` | 管理评测集 |
 
-## batch vs plan-apply（易混点）
+运行版本语义：
 
-- **batch** 是**运行期**能力：节点对某个数组输入端口**逐项执行**底层执行器并聚合（`{items,count}`）。
-  样例里分类器对 dataset 的 `rows` 逐条跑，就是 batch。
-- **plan-apply** 是**构建期**能力：把一份 JSON plan **一次性建成图**（替代逐条 add-node/bind），
-  **不是**「批量起 N 个 run」。单图内的批量评测由节点级 batch 覆盖。
+- 省略 `--version`：运行最新发布版本。
+- `--version -1`：运行当前草稿。
+- `--version N`：运行指定发布版本，`N > 0`。
 
-## 鉴权
+## HTTP API
 
-应用内提供**可选** API Key 兜底（`X-API-Key` 头，常量时间比较）：
-- `config.auth.api_keys` 为空 → 放行（dev/测试零改动）；配置后校验，失败 401。
-- 限流基于令牌桶（`rate_rps`/`rate_burst`）；`/healthz`、`/ping`、SSE 长连接豁免。
+API 前缀为 `/v1`，统一返回：
 
-> 生产环境企业级鉴权应由网关（SSO/Kani）负责；应用内 API Key 仅为无网关时的自保兜底。
+```json
+{"ok": true, "data": {}}
+```
 
-## 开发
+或：
+
+```json
+{"ok": false, "error": {"code": "NOT_FOUND", "message": "...", "details": {}}}
+```
+
+主要端点：
+
+| 资源 | 端点 |
+|---|---|
+| 健康检查 | `GET /healthz`、`GET /healthz/sidecar` |
+| Projects | `POST/GET /v1/projects`、`GET/PUT/DELETE /v1/projects/:id` |
+| Applications | `POST/GET /v1/applications`、`GET/PUT/DELETE /v1/applications/:id` |
+| Datasets | `POST/GET /v1/datasets`、`GET/PUT/DELETE /v1/datasets/:id` |
+| Workflows | `POST/GET /v1/workflows`、`GET/PUT/DELETE /v1/workflows/:id` |
+| 发布与校验 | `POST /v1/workflows/:id/publish`、`POST /v1/workflows/:id/validate` |
+| Node debug | `POST /v1/workflows/:id/node-debug`、`POST /v1/node-debug` |
+| Runs | `POST/GET /v1/runs`、`GET /v1/runs/:id` |
+| 运行事件 | `GET /v1/runs/:id/events`（SSE） |
+
+创建项目示例：
 
 ```bash
-make build      # go build ./...
-make test       # go test ./...（单元）
-# 集成测试（需 infra-up + migrate-up）：
+curl -sS -X POST http://127.0.0.1:8080/v1/projects \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"demo","description":"README example"}' | jq
+```
+
+运行工作流采用异步协议：`POST /v1/runs` 先返回 `run_id` 和 `pending`，随后通过 `GET /v1/runs/:id` 轮询，或订阅 SSE：
+
+```bash
+curl -sS -X POST http://127.0.0.1:8080/v1/runs \
+  -H 'Content-Type: application/json' \
+  -d '{"workflow_id":"<workflow-id>","version":-1,"input":{"message":"hello"}}' | jq
+```
+
+## 本地开发
+
+### 启动各组件
+
+本地运行 Go/Python 进程时，可只用 Compose 启动 MySQL 与 Redis：
+
+```bash
+make infra-up
+make migrate-up                 # 需要本机安装 goose
+
+make sidecar-install            # 首次创建 Python venv
+make run-sidecar                # 终端 1，127.0.0.1:8090
+make run-server                 # 终端 2，:8080
+make run-worker                 # 终端 3，默认 Redis 配置下必须启动
+```
+
+`make migrate-up` 使用：
+
+```text
+swf:swfpass@tcp(127.0.0.1:3308)/smart_workflow?parseTime=true
+```
+
+Goose 可按 [官方安装方式](https://github.com/pressly/goose)安装；完整 Compose 模式不需要宿主机安装 goose。
+
+### 配置
+
+配置优先级为：**环境变量 > 配置文件 > 默认值**。server 和 worker 均支持 `-config <path>`；环境变量使用 `SWF_` 前缀，嵌套项以下划线连接。
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `SWF_ENV` | `dev` | 运行环境 |
+| `SWF_SERVER_ADDR` | `:8080` | API 监听地址 |
+| `SWF_MYSQL_DSN` | 本地 `127.0.0.1:3308` DSN | MySQL 连接串 |
+| `SWF_REDIS_ADDR` | `127.0.0.1:6381` | Redis 地址；配置后 server 使用 asynq |
+| `SWF_REDIS_PASSWORD` | 空 | Redis 密码 |
+| `SWF_REDIS_DB` | `0` | Redis DB |
+| `SWF_SIDECAR_BASEURL` | `http://127.0.0.1:8090` | Python sidecar 地址 |
+| `SWF_LOG_LEVEL` | `info` | Zap 日志级别 |
+| `SWF_AUTH_API_KEYS` | 空 | 允许的 API Key；空表示关闭鉴权 |
+| `SWF_AUTH_RATE_RPS` | `0` | 全局每秒请求数；`<=0` 表示不限流 |
+| `SWF_AUTH_RATE_BURST` | `0` | 令牌桶突发容量 |
+
+开启应用内鉴权后，客户端需发送 `X-API-Key`。生产环境仍应由统一网关承担身份认证与授权，应用内 API Key 只作为无网关环境的基础保护。
+
+### 构建与测试
+
+```bash
+make build
+make build-swf
+make test
+```
+
+集成测试需要 MySQL 已启动并完成迁移：
+
+```bash
 SWF_TEST_DSN='swf:swfpass@tcp(127.0.0.1:3308)/smart_workflow?parseTime=true' \
   go test -tags integration ./...
 ```
+
+Python runner 契约与脱敏测试不依赖 FastAPI：
+
+```bash
+python3 sidecar/contract/test_contract.py
+python3 sidecar/test_runner_sanitize.py
+```
+
+## 项目结构
+
+```text
+cmd/
+  server/             gin API 服务
+  worker/             asynq 工作流消费者
+  swf/                CLI 入口
+internal/
+  api/                HTTP handlers、中间件、SSE
+  async/              asynq 提交器与 worker
+  cli/                Cobra 命令、本地 session、HTTP client
+  dsl/                IR/DSL、渲染、反渲染、依赖分析
+  engine/             builder、scheduler、变量池、节点执行器
+  service/            项目、工作流、应用、数据集、运行服务
+  storage/mysql/      sqlc 查询与存储实现
+  validator/          静态校验器
+sidecar/              FastAPI 门面与一次性 Python runner
+migrations/           Goose 数据库迁移
+deployments/          Dockerfiles 与 Docker Compose
+examples/sentiment/   可执行的端到端评测示例
+docs/                 按里程碑组织的实现解读
+```
+
+## 设计文档
+
+- [M1：IR / DSL 设计与代码解读](docs/M1_IR_DSL_解读.md)
+- [M2：存储层与版本发布解读](docs/M2_存储层与版本发布解读.md)
+- [M3：变量池与校验器解读](docs/M3_变量池与校验器解读.md)
+- [M4：执行引擎与调度器解读](docs/M4_执行引擎与调度器解读.md)
+- [M5：Python sidecar 与 code 节点解读](docs/M5_Python_sidecar与code节点解读.md)
+- [M6：HTTP API 与 node-debug 解读](docs/M6_HTTP_API与node-debug解读.md)
+- [M7：CLI 解读](docs/M7_CLI解读.md)
+- [GraphJSON / IR / BPMN 生成方案](docs/M5_GraphJSON-IR-BPMN生成方案.md)
+- [Agent CLI 设计](Smart-Workflow_Agent-CLI设计.md)
+- [实施计划与里程碑](plan.md)
+
+## 安全边界与限制
+
+- Python runner 提供的是**进程隔离、超时和输出限制**，不是真正的系统级沙箱。不要直接执行不受信任的外部代码；生产环境应增加容器级隔离、cgroup、seccomp 或 gVisor。
+- code 节点输出上限为 256 KiB，日志上限为 64 KiB；大对象存储尚未实现。
+- 默认发布版使用 Redis/asynq。server 与 worker 必须连接同一 Redis，否则运行会停留在 `pending`。
+- 当前仓库未提供 `LICENSE` 文件，使用或分发前请先确认授权方式。
